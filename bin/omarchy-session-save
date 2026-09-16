@@ -45,21 +45,48 @@ while IFS= read -r client; do
   [[ $seen_pids == *" $pid "* ]] && continue
   seen_pids+="$pid "
 
-  # Rebuild a shell-safe launch command from the process's original argv
-  cmd=""
-  while IFS= read -r -d '' arg; do
-    cmd+="$(printf '%q' "$arg") "
-  done <"/proc/$pid/cmdline"
-  cmd=${cmd% }
-  [[ -n $cmd ]] || continue
+  # Flatpak apps run inside a mount namespace, so /proc/<pid>/cmdline reflects
+  # the sandboxed path and isn't launchable from the host. Relaunch via the
+  # app id instead, read from the sandbox's own .flatpak-info marker.
+  flatpak_id=""
+  if [[ -r /proc/$pid/root/.flatpak-info ]]; then
+    flatpak_id=$(sed -n 's/^name=//p' /proc/$pid/root/.flatpak-info 2>/dev/null | head -n1)
+  fi
 
-  # For terminals, record the shell's working directory so it can be restored
+  if [[ -n $flatpak_id ]]; then
+    cmd="flatpak run $(printf '%q' "$flatpak_id")"
+  else
+    # Rebuild a shell-safe launch command from the process's original argv
+    cmd=""
+    while IFS= read -r -d '' arg; do
+      cmd+="$(printf '%q' "$arg") "
+    done <"/proc/$pid/cmdline"
+    cmd=${cmd% }
+    [[ -n $cmd ]] || continue
+  fi
+
+  # For terminals, record the shell's working directory so it can be restored,
+  # and detect a tmux session attached on that shell's tty so it can be
+  # reattached (or recreated under the same name) on restore.
   cwd=""
+  tmux_session=""
   if is_in "$class" "${TERMINAL_CLASSES[@]}"; then
     shell_pid=$(pgrep -P "$pid" 2>/dev/null | tail -n1 || true)
     if [[ -n ${shell_pid:-} ]]; then
       dir=$(readlink -f "/proc/$shell_pid/cwd" 2>/dev/null || true)
       [[ -d $dir ]] && cwd=$dir
+
+      if command -v tmux &>/dev/null; then
+        tty=$(ps -o tty= -p "$shell_pid" 2>/dev/null | tr -d '[:space:]')
+        if [[ -n $tty && $tty != '?' ]]; then
+          tmux_session=$(tmux list-clients -F '#{client_tty} #{session_name}' 2>/dev/null |
+            awk -v t="/dev/$tty" '$1==t{print $2; exit}')
+        fi
+        if [[ -n $tmux_session ]]; then
+          pane_cwd=$(tmux display-message -p -t "$tmux_session" '#{pane_current_path}' 2>/dev/null || true)
+          [[ -d ${pane_cwd:-} ]] && cwd=$pane_cwd
+        fi
+      fi
     fi
   fi
 
@@ -69,7 +96,8 @@ while IFS= read -r client; do
     --argjson floating "$floating" \
     --arg cmd "$cmd" \
     --arg cwd "$cwd" \
-    '{class: $class, workspace: $workspace, floating: $floating, cmd: $cmd, cwd: $cwd}')")
+    --arg tmux_session "$tmux_session" \
+    '{class: $class, workspace: $workspace, floating: $floating, cmd: $cmd, cwd: $cwd, tmux_session: $tmux_session}')")
 done < <(hyprctl clients -j | jq -c '.[]')
 
 if ((${#entries[@]} == 0)); then

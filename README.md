@@ -15,6 +15,12 @@ Omarchy, and pick up where you left off.
 - **Restore** runs automatically when the Omarchy shell starts after login
   and relaunches each window silently onto its saved workspace, without
   stealing focus. Terminals start back in their saved directories.
+- **Flatpak apps** are detected via their sandbox's `.flatpak-info` marker
+  and relaunched with `flatpak run <app-id>` instead of the unusable
+  sandboxed path from `/proc/<pid>/cmdline`.
+- **tmux sessions** running in a saved terminal are detected by tty and
+  reattached (or recreated under the same name, in the session's saved
+  working directory) with `tmux new-session -A -s <name>` on restore.
 - **Agent resume** (optional): if a herdr server was running at save time, the
   restore waits for herdr to come back and restarts `claude --continue` in the
   matching pane, so your Claude Code conversation resumes by itself.
@@ -92,7 +98,8 @@ scripts from `~/.local/bin` and
 - Omarchy (Quattro) with Hyprland **0.56+** — the restore dispatches through
   the Lua API: `hl.dispatch(hl.dsp.exec_cmd(...))`
 - `jq` and `flock` (both ship with Omarchy / util-linux)
-- Optional: herdr for agent resume; `notify-send` for save feedback
+- Optional: herdr for agent resume; `notify-send` for save feedback; `tmux`
+  and `flatpak` if you want their sessions/apps restored
 
 No sudo, no network access, no external downloads. The plugin only reads
 `hyprctl` output and `/proc`, and writes state under `~/.local/state/omarchy/`.
@@ -107,6 +114,10 @@ preserve actual application state across a reboot:
 - Windows sharing one process (e.g. several Chromium windows or web apps)
   collapse to a single relaunch entry.
 - Scratchpad/special workspaces are skipped.
+- tmux reattach only works for the terminal classes this plugin already
+  supports (Alacritty, kitty, foot, ghostty, wezterm), and only recreates
+  the named session — panes/windows inside it are restored by tmux itself
+  (e.g. via tmux-resurrect/continuum) if you use one, not by this plugin.
 - Only `claude` agents get a resume flag in herdr; other agent kinds start
   fresh.
 - Saves triggered outside the menu (plain `systemctl reboot`) require running

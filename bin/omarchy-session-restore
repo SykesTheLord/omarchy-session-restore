@@ -29,15 +29,33 @@ $dry_run || log "started ($(jq 'length' "$MANIFEST") window(s))"
 launcher=""
 command -v uwsm-app &>/dev/null && launcher="uwsm-app -- "
 
+# Flags each supported terminal uses to run a command instead of its default
+# shell, used to reattach tmux sessions in place.
+term_exec_flag() {
+  case "$1" in
+  Alacritty | com.mitchellh.ghostty) printf '%s' "-e" ;;
+  org.wezfurlong.wezterm) printf '%s' "start --" ;;
+  kitty | foot) printf '%s' "" ;;
+  esac
+}
+
 while IFS= read -r entry; do
   ws=$(jq -r '.workspace' <<<"$entry")
   class=$(jq -r '.class' <<<"$entry")
   cmd=$(jq -r '.cmd' <<<"$entry")
   cwd=$(jq -r '.cwd' <<<"$entry")
   floating=$(jq -r '.floating' <<<"$entry")
+  tmux_session=$(jq -r '.tmux_session // ""' <<<"$entry")
 
-  # Terminals: start in the saved working directory
-  if [[ -n $cwd ]]; then
+  if [[ -n $tmux_session ]] && command -v tmux &>/dev/null; then
+    # Reattach (or recreate) the saved tmux session by name instead of just
+    # restarting a plain shell in the terminal.
+    tmux_cmd="tmux new-session -A -s $(printf '%q' "$tmux_session")"
+    [[ -n $cwd ]] && tmux_cmd+=" -c $(printf '%q' "$cwd")"
+    exec_flag=$(term_exec_flag "$class")
+    cmd="$cmd${exec_flag:+ $exec_flag} $tmux_cmd"
+  elif [[ -n $cwd ]]; then
+    # Terminals: start in the saved working directory
     cmd="sh -c $(printf '%q' "cd $(printf '%q' "$cwd") && exec $cmd")"
   fi
 
