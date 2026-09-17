@@ -39,6 +39,103 @@ term_exec_flag() {
   esac
 }
 
+# Rebuild every window and pane of a saved tmux session server-side, offline,
+# before anything attaches to it. Reattaching with `new-session -A` only
+# recreates a single bare shell because the original tmux server (and all its
+# other windows/panes) died at reboot; this recreates the full layout instead.
+declare -A built_tmux_sessions=()
+
+rebuild_tmux_session() {
+  local session=$1 windows_json=$2
+  [[ -n ${built_tmux_sessions[$session]:-} ]] && return
+  built_tmux_sessions[$session]=1
+
+  local win_count
+  win_count=$(jq 'length' <<<"$windows_json")
+  ((win_count > 0)) || return
+
+  tmux kill-session -t "$session" 2>/dev/null || true
+
+  local active_window=0 active_pane=0
+
+  for ((wi = 0; wi < win_count; wi++)); do
+    local w panes pane_count w_index w_name w_layout w_active p0_cwd
+    w=$(jq -c ".[$wi]" <<<"$windows_json")
+    w_index=$(jq -r '.index' <<<"$w")
+    w_name=$(jq -r '.name' <<<"$w")
+    w_layout=$(jq -r '.layout' <<<"$w")
+    w_active=$(jq -r '.active' <<<"$w")
+    panes=$(jq -c '.panes' <<<"$w")
+    pane_count=$(jq 'length' <<<"$panes")
+    ((pane_count > 0)) || continue
+    p0_cwd=$(jq -r '.[0].cwd // ""' <<<"$panes")
+
+    if ((wi == 0)); then
+      local args=(-d -s "$session" -n "$w_name")
+      [[ -n $p0_cwd ]] && args+=(-c "$p0_cwd")
+      tmux new-session "${args[@]}" || continue
+    else
+      local args=(-t "$session" -n "$w_name")
+      [[ -n $p0_cwd ]] && args+=(-c "$p0_cwd")
+      tmux new-window "${args[@]}" || continue
+    fi
+    [[ $w_active == true ]] && active_window=$w_index
+
+    # tmux assigns each new pane the next index in creation order, so
+    # splitting in ascending original-index order reproduces the same
+    # pane indices used below to address and re-populate them.
+    for ((pi = 1; pi < pane_count; pi++)); do
+      local p_cwd args
+      p_cwd=$(jq -r ".[$pi].cwd // \"\"" <<<"$panes")
+      args=(-t "$session:$w_index")
+      [[ -n $p_cwd ]] && args+=(-c "$p_cwd")
+      tmux split-window "${args[@]}" 2>/dev/null
+    done
+
+    [[ -n $w_layout && $w_layout != null ]] && tmux select-layout -t "$session:$w_index" "$w_layout" 2>/dev/null
+
+    for ((pi = 0; pi < pane_count; pi++)); do
+      local p_index p_cmd p_active
+      p_index=$(jq -r ".[$pi].index" <<<"$panes")
+      p_cmd=$(jq -r ".[$pi].cmd // \"\"" <<<"$panes")
+      p_active=$(jq -r ".[$pi].active" <<<"$panes")
+      [[ $p_active == true ]] && active_pane=$p_index
+      [[ -n $p_cmd ]] && tmux send-keys -t "$session:$w_index.$p_index" "$p_cmd" Enter 2>/dev/null
+    done
+  done
+
+  tmux select-window -t "$session:$active_window" 2>/dev/null
+  tmux select-pane -t "$session:$active_window.$active_pane" 2>/dev/null
+}
+
+# Flatpak's `flatpak run` hands the real app off to a bwrap sandbox process,
+# which breaks Hyprland's PID-based tracking for the `[workspace N silent]`
+# exec rule; combined with Flatpak's slower startup, the window frequently
+# lands on whatever workspace is active instead of the saved one. Watch for
+# the app's window to appear and explicitly move it once it does.
+launch_flatpak_workspace_watcher() {
+  local app_id=$1 ws=$2
+  local before=" "
+  while IFS= read -r pid; do before+="$pid "; done < <(hyprctl clients -j | jq -r '.[].pid')
+
+  (
+    for _ in $(seq 1 50); do
+      sleep 0.3
+      while IFS=' ' read -r pid cur_ws; do
+        [[ -n $pid ]] || continue
+        [[ $before == *" $pid "* ]] && continue
+        [[ -r /proc/$pid/root/.flatpak-info ]] || continue
+        found_id=$(sed -n 's/^name=//p' "/proc/$pid/root/.flatpak-info" 2>/dev/null | head -n1)
+        [[ $found_id == "$app_id" ]] || continue
+        [[ $cur_ws == "$ws" ]] && exit 0
+        hyprctl dispatch movetoworkspacesilent "$ws,pid:$pid" >/dev/null 2>&1
+        exit 0
+      done < <(hyprctl clients -j 2>/dev/null | jq -r '.[] | "\(.pid) \(.workspace.id)"')
+    done
+  ) &
+  disown
+}
+
 while IFS= read -r entry; do
   ws=$(jq -r '.workspace' <<<"$entry")
   class=$(jq -r '.class' <<<"$entry")
@@ -46,12 +143,16 @@ while IFS= read -r entry; do
   cwd=$(jq -r '.cwd' <<<"$entry")
   floating=$(jq -r '.floating' <<<"$entry")
   tmux_session=$(jq -r '.tmux_session // ""' <<<"$entry")
+  tmux_windows=$(jq -c '.tmux_windows // []' <<<"$entry")
+
+  flatpak_app_id=""
+  [[ $cmd == "flatpak run "* ]] && flatpak_app_id=${cmd#flatpak run }
 
   if [[ -n $tmux_session ]] && command -v tmux &>/dev/null; then
-    # Reattach (or recreate) the saved tmux session by name instead of just
-    # restarting a plain shell in the terminal.
-    tmux_cmd="tmux new-session -A -s $(printf '%q' "$tmux_session")"
-    [[ -n $cwd ]] && tmux_cmd+=" -c $(printf '%q' "$cwd")"
+    $dry_run || rebuild_tmux_session "$tmux_session" "$tmux_windows"
+    # Attach to the session that was just rebuilt server-side instead of
+    # creating a fresh bare shell.
+    tmux_cmd="tmux attach -t $(printf '%q' "$tmux_session")"
     exec_flag=$(term_exec_flag "$class")
     cmd="$cmd${exec_flag:+ $exec_flag} $tmux_cmd"
   elif [[ -n $cwd ]]; then
@@ -74,6 +175,7 @@ while IFS= read -r entry; do
   else
     if hyprctl eval "$lua" >/dev/null; then
       log "launched $class on workspace $ws"
+      [[ -n $flatpak_app_id ]] && launch_flatpak_workspace_watcher "$flatpak_app_id" "$ws"
     else
       log "failed to launch $class on workspace $ws"
       exit 1

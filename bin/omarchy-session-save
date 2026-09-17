@@ -70,6 +70,7 @@ while IFS= read -r client; do
   # reattached (or recreated under the same name) on restore.
   cwd=""
   tmux_session=""
+  tmux_windows_json="[]"
   if is_in "$class" "${TERMINAL_CLASSES[@]}"; then
     shell_pid=$(pgrep -P "$pid" 2>/dev/null | tail -n1 || true)
     if [[ -n ${shell_pid:-} ]]; then
@@ -85,6 +86,42 @@ while IFS= read -r client; do
         if [[ -n $tmux_session ]]; then
           pane_cwd=$(tmux display-message -p -t "$tmux_session" '#{pane_current_path}' 2>/dev/null || true)
           [[ -d ${pane_cwd:-} ]] && cwd=$pane_cwd
+
+          # Capture every window and pane in the session (not just the active
+          # pane) so restore can rebuild the full layout instead of a single
+          # bare shell.
+          win_entries=()
+          while IFS=$'\t' read -r w_index w_name w_layout w_active; do
+            pane_entries=()
+            while IFS=$'\t' read -r p_index p_cwd p_pid p_active; do
+              pane_cmd=""
+              fg_pid=$(pgrep -P "$p_pid" 2>/dev/null | tail -n1 || true)
+              if [[ -n ${fg_pid:-} && -r /proc/$fg_pid/cmdline ]]; then
+                c=""
+                while IFS= read -r -d '' arg; do c+="$(printf '%q' "$arg") "; done <"/proc/$fg_pid/cmdline"
+                pane_cmd=${c% }
+              fi
+              pane_entries+=("$(jq -n \
+                --argjson index "$p_index" \
+                --arg cwd "$p_cwd" \
+                --arg cmd "$pane_cmd" \
+                --argjson active "$([[ $p_active == 1 ]] && echo true || echo false)" \
+                '{index: $index, cwd: $cwd, cmd: $cmd, active: $active}')")
+            done < <(tmux list-panes -t "$tmux_session:$w_index" -F $'#{pane_index}\t#{pane_current_path}\t#{pane_pid}\t#{pane_active}' 2>/dev/null)
+
+            panes_json=$(printf '%s\n' "${pane_entries[@]}" | jq -s '.')
+            win_entries+=("$(jq -n \
+              --argjson index "$w_index" \
+              --arg name "$w_name" \
+              --arg layout "$w_layout" \
+              --argjson active "$([[ $w_active == 1 ]] && echo true || echo false)" \
+              --argjson panes "$panes_json" \
+              '{index: $index, name: $name, layout: $layout, active: $active, panes: $panes}')")
+          done < <(tmux list-windows -t "$tmux_session" -F $'#{window_index}\t#{window_name}\t#{window_layout}\t#{window_active}' 2>/dev/null)
+
+          if ((${#win_entries[@]} > 0)); then
+            tmux_windows_json=$(printf '%s\n' "${win_entries[@]}" | jq -s '.')
+          fi
         fi
       fi
     fi
@@ -97,7 +134,8 @@ while IFS= read -r client; do
     --arg cmd "$cmd" \
     --arg cwd "$cwd" \
     --arg tmux_session "$tmux_session" \
-    '{class: $class, workspace: $workspace, floating: $floating, cmd: $cmd, cwd: $cwd, tmux_session: $tmux_session}')")
+    --argjson tmux_windows "$tmux_windows_json" \
+    '{class: $class, workspace: $workspace, floating: $floating, cmd: $cmd, cwd: $cwd, tmux_session: $tmux_session, tmux_windows: $tmux_windows}')")
 done < <(hyprctl clients -j | jq -c '.[]')
 
 if ((${#entries[@]} == 0)); then
