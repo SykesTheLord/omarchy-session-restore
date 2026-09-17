@@ -17,10 +17,15 @@ Omarchy, and pick up where you left off.
   stealing focus. Terminals start back in their saved directories.
 - **Flatpak apps** are detected via their sandbox's `.flatpak-info` marker
   and relaunched with `flatpak run <app-id>` instead of the unusable
-  sandboxed path from `/proc/<pid>/cmdline`.
-- **tmux sessions** running in a saved terminal are detected by tty and
-  reattached (or recreated under the same name, in the session's saved
-  working directory) with `tmux new-session -A -s <name>` on restore.
+  sandboxed path from `/proc/<pid>/cmdline`. Because Hyprland can't match a
+  sandboxed window back to the launch, restore places them with a temporary
+  window rule on the app's class (splash/updater windows included) that
+  switches itself off after two minutes.
+- **tmux sessions** — every session on the tmux server, attached or
+  detached — are saved with their windows, split layouts, pane working
+  directories and the command each pane was running. Restore rebuilds them
+  detached, re-runs those commands, and reattaches each saved terminal to its
+  session. Sessions that are already running are left untouched.
 - **Agent resume** (optional): if a herdr server was running at save time, the
   restore waits for herdr to come back and restarts `claude --continue` in the
   matching pane, so your Claude Code conversation resumes by itself.
@@ -75,6 +80,7 @@ into Omarchy everything relaunches within a few seconds of login.
 State lives in `~/.local/state/omarchy/`:
 
 - `session.json` — the window manifest (renamed to `.restored` after use)
+- `tmux-sessions.json` — tmux sessions to rebuild (also consumed after use)
 - `herdr-agents.json` — agent panes to resume (also consumed after use)
 - `session.lock` — guards against concurrent restores
 - `session-restore.log` — timestamped save, window launch, and agent resume results
@@ -87,7 +93,7 @@ omarchy plugin remove io.github.wbarakat.session-restore
 
 Then remove the menu entries you added to
 `~/.config/omarchy/extensions/omarchy-menu.jsonc` (if any) and, optionally,
-the state files: `rm -f ~/.local/state/omarchy/session.json* ~/.local/state/omarchy/herdr-agents.json* ~/.local/state/omarchy/session.lock ~/.local/state/omarchy/session-restore.log`
+the state files: `rm -f ~/.local/state/omarchy/session.json* ~/.local/state/omarchy/tmux-sessions.json* ~/.local/state/omarchy/herdr-agents.json* ~/.local/state/omarchy/session.lock ~/.local/state/omarchy/session-restore.log`
 
 For a manual install, additionally delete the three `omarchy-session-*`
 scripts from `~/.local/bin` and
@@ -115,9 +121,11 @@ preserve actual application state across a reboot:
   collapse to a single relaunch entry.
 - Scratchpad/special workspaces are skipped.
 - tmux reattach only works for the terminal classes this plugin already
-  supports (Alacritty, kitty, foot, ghostty, wezterm), and only recreates
-  the named session — panes/windows inside it are restored by tmux itself
-  (e.g. via tmux-resurrect/continuum) if you use one, not by this plugin.
+  supports (Alacritty, kitty, foot, ghostty, wezterm). Pane commands are
+  re-run from their saved command line, so programs restart fresh (an editor
+  reopens its file, but scrollback and in-memory state are gone).
+- A Flatpak app's placement rule also applies to windows of that app you
+  open yourself within two minutes of login.
 - Only `claude` agents get a resume flag in herdr; other agent kinds start
   fresh.
 - Saves triggered outside the menu (plain `systemctl reboot`) require running

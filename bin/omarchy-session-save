@@ -7,6 +7,7 @@ set -euo pipefail
 
 STATE_DIR="$HOME/.local/state/omarchy"
 MANIFEST="$STATE_DIR/session.json"
+TMUX_STATE="$STATE_DIR/tmux-sessions.json"
 mkdir -p "$STATE_DIR"
 LOG="$STATE_DIR/session-restore.log"
 
@@ -25,6 +26,65 @@ is_in() {
   for i in "$@"; do [[ $i == "$x" ]] && return 0; done
   return 1
 }
+
+# Print a process's argv as a shell-safe command line
+quoted_cmdline() {
+  local arg cmd=""
+  while IFS= read -r -d '' arg; do cmd+="$(printf '%q' "$arg") "; done <"/proc/$1/cmdline"
+  printf '%s' "${cmd% }"
+}
+
+# Serialize one tmux session's windows and panes, including what each pane is
+# running, so restore can rebuild it after the tmux server dies at shutdown.
+tmux_session_json() {
+  local session=$1 w_index w_name w_layout w_active p_index p_cwd p_pid p_active fg_pid pane_cmd
+  local win_entries=() pane_entries=()
+
+  while IFS=$'\t' read -r w_index w_name w_layout w_active; do
+    pane_entries=()
+    while IFS=$'\t' read -r p_index p_cwd p_pid p_active; do
+      pane_cmd=""
+      fg_pid=$(pgrep -P "$p_pid" 2>/dev/null | tail -n1 || true)
+      [[ -n $fg_pid && -r /proc/$fg_pid/cmdline ]] && pane_cmd=$(quoted_cmdline "$fg_pid")
+      pane_entries+=("$(jq -n \
+        --argjson index "$p_index" \
+        --arg cwd "$p_cwd" \
+        --arg cmd "$pane_cmd" \
+        --argjson active "$([[ $p_active == 1 ]] && echo true || echo false)" \
+        '{index: $index, cwd: $cwd, cmd: $cmd, active: $active}')")
+    done < <(tmux list-panes -t "=$session:$w_index" -F $'#{pane_index}\t#{pane_current_path}\t#{pane_pid}\t#{pane_active}' 2>/dev/null)
+
+    ((${#pane_entries[@]} > 0)) || continue
+    win_entries+=("$(jq -n \
+      --argjson index "$w_index" \
+      --arg name "$w_name" \
+      --arg layout "$w_layout" \
+      --argjson active "$([[ $w_active == 1 ]] && echo true || echo false)" \
+      --argjson panes "$(printf '%s\n' "${pane_entries[@]}" | jq -s '.')" \
+      '{index: $index, name: $name, layout: $layout, active: $active, panes: $panes}')")
+  done < <(tmux list-windows -t "=$session" -F $'#{window_index}\t#{window_name}\t#{window_layout}\t#{window_active}' 2>/dev/null)
+
+  ((${#win_entries[@]} > 0)) || return 0
+  jq -n --arg name "$session" --argjson windows "$(printf '%s\n' "${win_entries[@]}" | jq -s '.')" \
+    '{name: $name, windows: $windows}'
+}
+
+# Snapshot every session on the tmux server, not only the ones a terminal
+# window is attached to, so detached sessions survive the reboot too.
+rm -f "$TMUX_STATE"
+session_count=0
+if command -v tmux &>/dev/null; then
+  sessions=()
+  while IFS= read -r session; do
+    json=$(tmux_session_json "$session")
+    [[ -n $json ]] && sessions+=("$json")
+  done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
+
+  if ((${#sessions[@]} > 0)); then
+    printf '%s\n' "${sessions[@]}" | jq -s '.' >"$TMUX_STATE"
+    session_count=${#sessions[@]}
+  fi
+fi
 
 entries=()
 seen_pids=" "
@@ -50,79 +110,31 @@ while IFS= read -r client; do
   # app id instead, read from the sandbox's own .flatpak-info marker.
   flatpak_id=""
   if [[ -r /proc/$pid/root/.flatpak-info ]]; then
-    flatpak_id=$(sed -n 's/^name=//p' /proc/$pid/root/.flatpak-info 2>/dev/null | head -n1)
+    flatpak_id=$(sed -n 's/^name=//p' /proc/"$pid"/root/.flatpak-info 2>/dev/null | head -n1)
   fi
 
   if [[ -n $flatpak_id ]]; then
     cmd="flatpak run $(printf '%q' "$flatpak_id")"
   else
-    # Rebuild a shell-safe launch command from the process's original argv
-    cmd=""
-    while IFS= read -r -d '' arg; do
-      cmd+="$(printf '%q' "$arg") "
-    done <"/proc/$pid/cmdline"
-    cmd=${cmd% }
+    cmd=$(quoted_cmdline "$pid")
     [[ -n $cmd ]] || continue
   fi
 
-  # For terminals, record the shell's working directory so it can be restored,
-  # and detect a tmux session attached on that shell's tty so it can be
-  # reattached (or recreated under the same name) on restore.
+  # For terminals, record the shell's working directory, and which tmux
+  # session (if any) is attached on that shell's tty so the relaunched
+  # terminal reattaches to it.
   cwd=""
   tmux_session=""
-  tmux_windows_json="[]"
   if is_in "$class" "${TERMINAL_CLASSES[@]}"; then
     shell_pid=$(pgrep -P "$pid" 2>/dev/null | tail -n1 || true)
-    if [[ -n ${shell_pid:-} ]]; then
+    if [[ -n $shell_pid ]]; then
       dir=$(readlink -f "/proc/$shell_pid/cwd" 2>/dev/null || true)
       [[ -d $dir ]] && cwd=$dir
 
-      if command -v tmux &>/dev/null; then
-        tty=$(ps -o tty= -p "$shell_pid" 2>/dev/null | tr -d '[:space:]')
-        if [[ -n $tty && $tty != '?' ]]; then
-          tmux_session=$(tmux list-clients -F '#{client_tty} #{session_name}' 2>/dev/null |
-            awk -v t="/dev/$tty" '$1==t{print $2; exit}')
-        fi
-        if [[ -n $tmux_session ]]; then
-          pane_cwd=$(tmux display-message -p -t "$tmux_session" '#{pane_current_path}' 2>/dev/null || true)
-          [[ -d ${pane_cwd:-} ]] && cwd=$pane_cwd
-
-          # Capture every window and pane in the session (not just the active
-          # pane) so restore can rebuild the full layout instead of a single
-          # bare shell.
-          win_entries=()
-          while IFS=$'\t' read -r w_index w_name w_layout w_active; do
-            pane_entries=()
-            while IFS=$'\t' read -r p_index p_cwd p_pid p_active; do
-              pane_cmd=""
-              fg_pid=$(pgrep -P "$p_pid" 2>/dev/null | tail -n1 || true)
-              if [[ -n ${fg_pid:-} && -r /proc/$fg_pid/cmdline ]]; then
-                c=""
-                while IFS= read -r -d '' arg; do c+="$(printf '%q' "$arg") "; done <"/proc/$fg_pid/cmdline"
-                pane_cmd=${c% }
-              fi
-              pane_entries+=("$(jq -n \
-                --argjson index "$p_index" \
-                --arg cwd "$p_cwd" \
-                --arg cmd "$pane_cmd" \
-                --argjson active "$([[ $p_active == 1 ]] && echo true || echo false)" \
-                '{index: $index, cwd: $cwd, cmd: $cmd, active: $active}')")
-            done < <(tmux list-panes -t "$tmux_session:$w_index" -F $'#{pane_index}\t#{pane_current_path}\t#{pane_pid}\t#{pane_active}' 2>/dev/null)
-
-            panes_json=$(printf '%s\n' "${pane_entries[@]}" | jq -s '.')
-            win_entries+=("$(jq -n \
-              --argjson index "$w_index" \
-              --arg name "$w_name" \
-              --arg layout "$w_layout" \
-              --argjson active "$([[ $w_active == 1 ]] && echo true || echo false)" \
-              --argjson panes "$panes_json" \
-              '{index: $index, name: $name, layout: $layout, active: $active, panes: $panes}')")
-          done < <(tmux list-windows -t "$tmux_session" -F $'#{window_index}\t#{window_name}\t#{window_layout}\t#{window_active}' 2>/dev/null)
-
-          if ((${#win_entries[@]} > 0)); then
-            tmux_windows_json=$(printf '%s\n' "${win_entries[@]}" | jq -s '.')
-          fi
-        fi
+      tty=$(ps -o tty= -p "$shell_pid" 2>/dev/null | tr -d '[:space:]')
+      if ((session_count > 0)) && [[ -n $tty && $tty != '?' ]]; then
+        tmux_session=$(tmux list-clients -F '#{client_tty}'$'\t''#{session_name}' 2>/dev/null |
+          awk -F '\t' -v t="/dev/$tty" '$1==t{print $2; exit}')
       fi
     fi
   fi
@@ -134,14 +146,13 @@ while IFS= read -r client; do
     --arg cmd "$cmd" \
     --arg cwd "$cwd" \
     --arg tmux_session "$tmux_session" \
-    --argjson tmux_windows "$tmux_windows_json" \
-    '{class: $class, workspace: $workspace, floating: $floating, cmd: $cmd, cwd: $cwd, tmux_session: $tmux_session, tmux_windows: $tmux_windows}')")
+    '{class: $class, workspace: $workspace, floating: $floating, cmd: $cmd, cwd: $cwd, tmux_session: $tmux_session}')")
 done < <(hyprctl clients -j | jq -c '.[]')
 
 if ((${#entries[@]} == 0)); then
   rm -f "$MANIFEST"
-  log "no windows found"
-  [[ ${1:-} == --quiet ]] || echo "No windows to save"
+  log "no windows found, saved $session_count tmux session(s)"
+  [[ ${1:-} == --quiet ]] || echo "No windows to save ($session_count tmux session(s) saved)"
   exit 0
 fi
 
@@ -159,5 +170,5 @@ if command -v herdr &>/dev/null; then
   fi
 fi
 
-log "saved ${#entries[@]} window(s) and $agent_count agent(s)"
-[[ ${1:-} == --quiet ]] || echo "Saved ${#entries[@]} window(s) to $MANIFEST"
+log "saved ${#entries[@]} window(s), $session_count tmux session(s) and $agent_count agent(s)"
+[[ ${1:-} == --quiet ]] || echo "Saved ${#entries[@]} window(s) and $session_count tmux session(s) to $STATE_DIR"

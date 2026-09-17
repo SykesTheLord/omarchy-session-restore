@@ -6,211 +6,215 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(dirname "$(realpath "$0")")
-MANIFEST="$HOME/.local/state/omarchy/session.json"
-mkdir -p "$(dirname "$MANIFEST")"
-LOG="${MANIFEST%.json}-restore.log"
+STATE_DIR="$HOME/.local/state/omarchy"
+MANIFEST="$STATE_DIR/session.json"
+TMUX_STATE="$STATE_DIR/tmux-sessions.json"
+mkdir -p "$STATE_DIR"
+LOG="$STATE_DIR/session-restore.log"
+
+# How long a Flatpak app's placement rule stays active. Generous because apps
+# like Discord show an updater first and only map their main window after any
+# pending update has downloaded.
+FLATPAK_RULE_TIMEOUT_MS=120000
 
 log() {
   printf '%s restore: %s\n' "$(date --iso-8601=seconds)" "$*" >>"$LOG"
 }
 
 # Only one restore may run at a time: the shell plugin service and the
-# post-boot hook can both fire around login.
-exec 9>"${MANIFEST%.json}.lock"
+# post-boot hook can both fire around login. Every process that can outlive
+# this script (tmux server, herdr agent resume) must close fd 9, or it keeps
+# the lock held and every later restore silently exits here.
+exec 9>"$STATE_DIR/session.lock"
 flock -n 9 || exit 0
 
-[[ -f $MANIFEST ]] || exit 0
+[[ -f $MANIFEST || -f $TMUX_STATE ]] || exit 0
 
 dry_run=false
 [[ ${1:-} == --dry-run ]] && dry_run=true
 
-$dry_run || log "started ($(jq 'length' "$MANIFEST") window(s))"
-
-launcher=""
-command -v uwsm-app &>/dev/null && launcher="uwsm-app -- "
-
-# Flags each supported terminal uses to run a command instead of its default
-# shell, used to reattach tmux sessions in place.
-term_exec_flag() {
-  case "$1" in
-  Alacritty | com.mitchellh.ghostty) printf '%s' "-e" ;;
-  org.wezfurlong.wezterm) printf '%s' "start --" ;;
-  kitty | foot) printf '%s' "" ;;
-  esac
+# Wrap a string in a Lua long bracket, which needs no escaping inside
+lua_string() {
+  local level="="
+  while [[ "$1]" == *"]${level}]"* ]]; do level+="="; done
+  printf '[%s[%s]%s]' "$level" "$1" "$level"
 }
 
-# Rebuild every window and pane of a saved tmux session server-side, offline,
-# before anything attaches to it. Reattaching with `new-session -A` only
-# recreates a single bare shell because the original tmux server (and all its
-# other windows/panes) died at reboot; this recreates the full layout instead.
-declare -A built_tmux_sessions=()
-
+# Rebuild a saved tmux session's windows and panes detached, so the relaunched
+# terminal (if any) attaches to the full layout rather than a single shell.
 rebuild_tmux_session() {
   local session=$1 windows_json=$2
-  [[ -n ${built_tmux_sessions[$session]:-} ]] && return
-  built_tmux_sessions[$session]=1
+  local win_count wi pi w w_index w_name w_layout panes pane_count p_cwd p_index p_cmd size created
+  local active_window="" active_pane="" args=()
 
-  local win_count
   win_count=$(jq 'length' <<<"$windows_json")
-  ((win_count > 0)) || return
-
-  # `tmux new-session -d` forks a long-lived tmux server when none is running
-  # yet; without closing fd 9 here, that server inherits the restore lock and
-  # holds it open forever, so every later restore silently no-ops on flock.
-  tmux kill-session -t "$session" 9>&- 2>/dev/null || true
-
-  local active_window=0 active_pane=0
+  ((win_count > 0)) || return 1
 
   for ((wi = 0; wi < win_count; wi++)); do
-    local w panes pane_count w_index w_name w_layout w_active p0_cwd
     w=$(jq -c ".[$wi]" <<<"$windows_json")
     w_index=$(jq -r '.index' <<<"$w")
     w_name=$(jq -r '.name' <<<"$w")
-    w_layout=$(jq -r '.layout' <<<"$w")
-    w_active=$(jq -r '.active' <<<"$w")
+    w_layout=$(jq -r '.layout // ""' <<<"$w")
     panes=$(jq -c '.panes' <<<"$w")
     pane_count=$(jq 'length' <<<"$panes")
     ((pane_count > 0)) || continue
-    p0_cwd=$(jq -r '.[0].cwd // ""' <<<"$panes")
+    p_cwd=$(jq -r '.[0].cwd // ""' <<<"$panes")
+    [[ -d $p_cwd ]] || p_cwd=$HOME # e.g. a directory that only exists on the other OS
+    [[ $(jq -r '.active' <<<"$w") == true ]] && active_window=$w_index
 
-    if ((wi == 0)); then
-      local args=(-d -s "$session" -n "$w_name")
-      [[ -n $p0_cwd ]] && args+=(-c "$p0_cwd")
-      tmux new-session "${args[@]}" 9>&- || continue
+    if ! tmux has-session -t "=$session" 9>&- 2>/dev/null; then
+      # Size the detached session like the saved window so splits have room
+      args=(-d -s "$session" -n "$w_name" -c "$p_cwd" -P -F '#{window_index}')
+      size=${w_layout#*,}
+      size=${size%%,*}
+      [[ $size =~ ^([0-9]+)x([0-9]+)$ ]] && args+=(-x "${BASH_REMATCH[1]}" -y "${BASH_REMATCH[2]}")
+      created=$(tmux new-session "${args[@]}" 9>&-) || return 1
+      if [[ $created != "$w_index" ]]; then
+        tmux move-window -s "=$session:$created" -t "=$session:$w_index" 9>&- || true
+      fi
     else
-      local args=(-t "$session" -n "$w_name")
-      [[ -n $p0_cwd ]] && args+=(-c "$p0_cwd")
-      tmux new-window "${args[@]}" 9>&- || continue
+      tmux new-window -d -t "=$session:$w_index" -n "$w_name" -c "$p_cwd" 9>&- || continue
     fi
-    [[ $w_active == true ]] && active_window=$w_index
 
-    # tmux assigns each new pane the next index in creation order, so
-    # splitting in ascending original-index order reproduces the same
-    # pane indices used below to address and re-populate them.
+    # A split is inserted right after the pane it splits, so splitting the
+    # previously created pane each time reproduces the saved pane order.
     for ((pi = 1; pi < pane_count; pi++)); do
-      local p_cwd args
       p_cwd=$(jq -r ".[$pi].cwd // \"\"" <<<"$panes")
-      args=(-t "$session:$w_index")
-      [[ -n $p_cwd ]] && args+=(-c "$p_cwd")
-      tmux split-window "${args[@]}" 9>&- 2>/dev/null
+      [[ -d $p_cwd ]] || p_cwd=$HOME
+      p_index=$(jq -r ".[$((pi - 1))].index" <<<"$panes")
+      tmux split-window -d -t "=$session:$w_index.$p_index" -c "$p_cwd" 9>&- 2>/dev/null || true
     done
-
-    [[ -n $w_layout && $w_layout != null ]] && tmux select-layout -t "$session:$w_index" "$w_layout" 9>&- 2>/dev/null
+    if [[ -n $w_layout ]]; then
+      tmux select-layout -t "=$session:$w_index" "$w_layout" 9>&- 2>/dev/null || true
+    fi
 
     for ((pi = 0; pi < pane_count; pi++)); do
-      local p_index p_cmd p_active
       p_index=$(jq -r ".[$pi].index" <<<"$panes")
       p_cmd=$(jq -r ".[$pi].cmd // \"\"" <<<"$panes")
-      p_active=$(jq -r ".[$pi].active" <<<"$panes")
-      [[ $p_active == true ]] && active_pane=$p_index
-      [[ -n $p_cmd ]] && tmux send-keys -t "$session:$w_index.$p_index" "$p_cmd" Enter 9>&- 2>/dev/null
+      if [[ $(jq -r ".[$pi].active" <<<"$panes") == true && $w_index == "$active_window" ]]; then
+        active_pane=$p_index
+      fi
+      if [[ -n $p_cmd ]]; then
+        tmux send-keys -t "=$session:$w_index.$p_index" -l -- "$p_cmd" 9>&- 2>/dev/null &&
+          tmux send-keys -t "=$session:$w_index.$p_index" Enter 9>&- 2>/dev/null || true
+      fi
     done
   done
 
-  tmux select-window -t "$session:$active_window" 9>&- 2>/dev/null
-  tmux select-pane -t "$session:$active_window.$active_pane" 9>&- 2>/dev/null
+  tmux has-session -t "=$session" 9>&- 2>/dev/null || return 1
+  [[ -n $active_window ]] && tmux select-window -t "=$session:$active_window" 9>&- 2>/dev/null || true
+  [[ -n $active_pane ]] && tmux select-pane -t "=$session:$active_window.$active_pane" 9>&- 2>/dev/null || true
+  return 0
 }
 
-# Flatpak's `flatpak run` hands the real app off to a bwrap sandbox process,
-# which breaks Hyprland's PID-based tracking for the `[workspace N silent]`
-# exec rule; combined with Flatpak's slower startup, the window frequently
-# lands on whatever workspace is active instead of the saved one. Watch for
-# the app's window to appear and explicitly move it once it does.
-#
-# `before` must be captured by the caller BEFORE the exec dispatch runs, so a
-# Flatpak that maps its window unusually fast can't already be in the
-# baseline (which would make it permanently invisible to the "new pid" check
-# below).
-launch_flatpak_workspace_watcher() {
-  local app_id=$1 ws=$2 before=$3
-
-  # Runs for up to 15s in the background, past the parent script's own
-  # lifetime, so it must not hold the restore lock (fd 9) open that whole time.
-  (
-    exec 9>&-
-    for _ in $(seq 1 50); do
-      sleep 0.3
-      while IFS=' ' read -r pid cur_ws; do
-        [[ -n $pid ]] || continue
-        [[ $before == *" $pid "* ]] && continue
-        [[ -r /proc/$pid/root/.flatpak-info ]] || continue
-        found_id=$(sed -n 's/^name=//p' "/proc/$pid/root/.flatpak-info" 2>/dev/null | head -n1)
-        [[ $found_id == "$app_id" ]] || continue
-        [[ $cur_ws == "$ws" ]] && exit 0
-        # Hyprland 0.56+ evaluates `dispatch <name> <args>` as Lua, so a raw
-        # "movetoworkspacesilent ws,pid:N" dispatch fails outright; go through
-        # hl.dispatch/hl.get_window instead, matching what the shipped
-        # Hyprland/Omarchy lua configs use for this dispatcher. `follow =
-        # false` is the actual "don't steal focus" flag here (there is no
-        # `silent` key on this dispatcher).
-        hyprctl eval "hl.dispatch(hl.dsp.window.move({ window = hl.get_window('pid:$pid'), workspace = '$ws', follow = false }))" >/dev/null 2>&1
-        exit 0
-      done < <(hyprctl clients -j 2>/dev/null | jq -r '.[] | "\(.pid) \(.workspace.id)"')
-    done
-  ) &
-  disown
+# Flatpak apps map their windows from a bwrap-sandboxed child that Hyprland
+# can't tie back to the exec, so the [workspace] exec rule never applies to
+# them. Instead, add a temporary window rule matching the app's class: it
+# places every window the app maps (updater splash included) at map time,
+# keeps it from pulling focus when it activates, and a timer switches it off
+# so windows opened later behave normally. The rule and timer are kept in a
+# Lua global so they can't be garbage-collected before the timer fires.
+flatpak_rule_lua() {
+  local class=$1 ws=$2 floating=$3 regex float=""
+  regex="^($(sed 's/[][\\.^$*+?(){}|]/\\&/g' <<<"$class"))\$"
+  [[ $floating == true ]] && float=", float = true"
+  cat <<EOF
+_G.session_restore_rules = _G.session_restore_rules or {}
+local entry = {}
+entry.rule = hl.window_rule({ match = { class = $(lua_string "$regex") }, workspace = $(lua_string "$ws silent"), focus_on_activate = false$float })
+entry.timer = hl.timer(function()
+  entry.rule:set_enabled(false)
+  _G.session_restore_rules[entry] = nil
+end, { timeout = $FLATPAK_RULE_TIMEOUT_MS, type = "oneshot" })
+_G.session_restore_rules[entry] = true
+EOF
 }
 
-while IFS= read -r entry; do
-  ws=$(jq -r '.workspace' <<<"$entry")
-  class=$(jq -r '.class' <<<"$entry")
-  cmd=$(jq -r '.cmd' <<<"$entry")
-  cwd=$(jq -r '.cwd' <<<"$entry")
-  floating=$(jq -r '.floating' <<<"$entry")
-  tmux_session=$(jq -r '.tmux_session // ""' <<<"$entry")
-  tmux_windows=$(jq -c '.tmux_windows // []' <<<"$entry")
-
-  flatpak_app_id=""
-  [[ $cmd == "flatpak run "* ]] && flatpak_app_id=${cmd#flatpak run }
-  flatpak_before=" "
-  if [[ -n $flatpak_app_id ]] && ! $dry_run; then
-    # Snapshot pids before the launch so the watcher can recognize the app's
-    # window even if it maps unusually fast.
-    while IFS= read -r p; do flatpak_before+="$p "; done < <(hyprctl clients -j | jq -r '.[].pid')
-  fi
-
-  if [[ -n $tmux_session ]] && command -v tmux &>/dev/null; then
-    $dry_run || rebuild_tmux_session "$tmux_session" "$tmux_windows"
-    # Attach to the session that was just rebuilt server-side instead of
-    # creating a fresh bare shell.
-    tmux_cmd="tmux attach -t $(printf '%q' "$tmux_session")"
-    exec_flag=$(term_exec_flag "$class")
-    cmd="$cmd${exec_flag:+ $exec_flag} $tmux_cmd"
-  elif [[ -n $cwd ]]; then
-    # Terminals: start in the saved working directory
-    cmd="sh -c $(printf '%q' "cd $(printf '%q' "$cwd") && exec $cmd")"
-  fi
-
-  rules="workspace $ws silent"
-  [[ $floating == true ]] && rules+="; float"
-  exec_arg="[$rules] ${launcher}${cmd}"
-
-  # Hyprland 0.56+ evaluates dispatches as Lua, so issue the exec through
-  # hl.dsp.exec_cmd with a long-bracket string that needs no escaping.
-  level="="
-  while [[ $exec_arg == *"]${level}]"* ]]; do level+="="; done
-  lua="hl.dispatch(hl.dsp.exec_cmd([${level}[${exec_arg}]${level}]))"
-
+hypr_eval() {
   if $dry_run; then
-    echo "hyprctl eval '$lua'"
+    printf 'hyprctl eval %q\n' "$1"
   else
-    if hyprctl eval "$lua" >/dev/null; then
-      log "launched $class on workspace $ws"
-      [[ -n $flatpak_app_id ]] && launch_flatpak_workspace_watcher "$flatpak_app_id" "$ws" "$flatpak_before"
+    hyprctl eval "$1" >/dev/null 2>&1
+  fi
+}
+
+if [[ -f $TMUX_STATE ]] && command -v tmux &>/dev/null; then
+  $dry_run || log "started ($(jq 'length' "$TMUX_STATE") tmux session(s))"
+  while IFS= read -r saved; do
+    name=$(jq -r '.name' <<<"$saved")
+    windows=$(jq -c '.windows' <<<"$saved")
+    if $dry_run; then
+      echo "tmux rebuild $(printf '%q' "$name") ($(jq 'length' <<<"$windows") window(s))"
+    elif tmux has-session -t "=$name" 9>&- 2>/dev/null; then
+      log "tmux session $name is already running, left untouched"
+    elif rebuild_tmux_session "$name" "$windows"; then
+      log "rebuilt tmux session $name"
+    else
+      log "failed to rebuild tmux session $name"
+    fi
+  done < <(jq -c '.[]' "$TMUX_STATE")
+  $dry_run || mv "$TMUX_STATE" "$TMUX_STATE.restored"
+fi
+
+if [[ -f $MANIFEST ]]; then
+  $dry_run || log "started ($(jq 'length' "$MANIFEST") window(s))"
+
+  launcher=""
+  command -v uwsm-app &>/dev/null && launcher="uwsm-app -- "
+
+  while IFS= read -r entry; do
+    ws=$(jq -r '.workspace' <<<"$entry")
+    class=$(jq -r '.class' <<<"$entry")
+    cmd=$(jq -r '.cmd' <<<"$entry")
+    cwd=$(jq -r '.cwd' <<<"$entry")
+    floating=$(jq -r '.floating' <<<"$entry")
+    tmux_session=$(jq -r '.tmux_session // ""' <<<"$entry")
+
+    if [[ -n $tmux_session ]] && command -v tmux &>/dev/null; then
+      # Attach to the rebuilt session; -A falls back to creating it if the
+      # rebuild failed, so the terminal doesn't open and immediately exit.
+      tmux_cmd="tmux new-session -A -s $(printf '%q' "$tmux_session")"
+      [[ -d $cwd ]] && tmux_cmd+=" -c $(printf '%q' "$cwd")"
+      case "$class" in
+      Alacritty | com.mitchellh.ghostty) cmd+=" -e $tmux_cmd" ;;
+      org.wezfurlong.wezterm) cmd+=" start -- $tmux_cmd" ;;
+      *) cmd+=" $tmux_cmd" ;; # kitty, foot
+      esac
+    elif [[ -n $cwd ]]; then
+      # Terminals: start in the saved working directory
+      cmd="sh -c $(printf '%q' "cd $(printf '%q' "$cwd") && exec $cmd")"
+    fi
+
+    if [[ $cmd == "flatpak run "* ]]; then
+      if hypr_eval "$(flatpak_rule_lua "$class" "$ws" "$floating")"; then
+        $dry_run || log "placing $class windows on workspace $ws for $((FLATPAK_RULE_TIMEOUT_MS / 1000))s"
+      else
+        log "failed to add placement rule for $class"
+      fi
+    fi
+
+    rules="workspace $ws silent"
+    [[ $floating == true ]] && rules+="; float"
+
+    # Hyprland 0.56+ evaluates dispatches as Lua, so issue the exec through
+    # hl.dsp.exec_cmd instead of `hyprctl dispatch exec`.
+    if hypr_eval "hl.dispatch(hl.dsp.exec_cmd($(lua_string "[$rules] ${launcher}${cmd}")))"; then
+      $dry_run || log "launched $class on workspace $ws"
     else
       log "failed to launch $class on workspace $ws"
       exit 1
     fi
-    sleep 0.2 # stagger launches so the compositor applies each workspace rule cleanly
-  fi
-done < <(jq -c '.[]' "$MANIFEST")
+    $dry_run || sleep 0.2 # stagger launches so the compositor applies each workspace rule cleanly
+  done < <(jq -c '.[]' "$MANIFEST")
 
-# Consume the manifest so the next boot doesn't relaunch everything again
-$dry_run || mv "$MANIFEST" "$MANIFEST.restored"
+  # Consume the manifest so the next boot doesn't relaunch everything again
+  $dry_run || mv "$MANIFEST" "$MANIFEST.restored"
+fi
+
 $dry_run || log "completed"
 
 # Resume AI agents inside herdr once its relaunched window brings the server up
-if [[ -f $HOME/.local/state/omarchy/herdr-agents.json ]]; then
+if [[ -f $STATE_DIR/herdr-agents.json ]]; then
   if $dry_run; then
     "$SCRIPT_DIR/omarchy-session-restore-agents" --dry-run
   else
